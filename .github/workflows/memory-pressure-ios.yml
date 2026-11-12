@@ -55,6 +55,8 @@ jobs:
           if ! xcrun --sdk iphoneos metal -v; then
             xcodebuild -downloadComponent MetalToolchain
           fi
+          # Preserve dependency diagnostics before shell_build removes its temporary tree.
+          bash services/opus/build.sh ios-arm64
       - name: Native regression and negative control
         run: |
           mkdir -p build/ci-tests
