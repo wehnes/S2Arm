@@ -4,6 +4,7 @@
 //   游戏映射到那里时 svc 回内存不足（svc_mem.c win_has），不崩。
 #include "native.h"
 #include "as_type.h"
+#include <errno.h>
 
 #define GB (1ull << 30)
 #define MB (1ull << 20)
@@ -36,7 +37,28 @@ static void vamm_small(s2a_layout *o, uint64_t at, uint64_t stack, uint64_t heap
     o->aslr_base = at;                 o->aslr_size = stack + heap + VAMM_SHARED;
 }
 static uint64_t g_app_pool = 0xCD500000ull;
-uint64_t s2a_app_pool(void) { return g_app_pool; }
+static pthread_once_t g_pool_once = PTHREAD_ONCE_INIT;
+static uint64_t g_pool_cap;
+// Optional reduced-memory experiment, 4096..65536 MiB. A game may require its
+// full native pool and fail allocations with a smaller budget. Unset/0 keeps
+// native capacity. Read once before layout: GetInfo, resource limits and memory
+// SVCs all use this getter, so reported and enforced capacity stay identical.
+static void app_pool_config(void) {
+    const char *value = getenv("S2A_APP_POOL_MB");
+    if (!value || !*value || !strcmp(value, "0")) return;
+    char *end; errno = 0;
+    uint64_t mb = strtoull(value, &end, 10);
+    if (errno || value[0] < '0' || value[0] > '9' || *end || mb < 4096 || mb > 65536) {
+        LOG("【黄】S2A_APP_POOL_MB 无效，需为 4096..65536 MiB，沿用原生应用池");
+        return;
+    }
+    g_pool_cap = mb * MB;
+    LOG("实验应用池上限 %llu MiB（S2A_APP_POOL_MB，仍受本款原生池上限约束）", (unsigned long long)mb);
+}
+uint64_t s2a_app_pool(void) {
+    pthread_once(&g_pool_once, app_pool_config);
+    return g_pool_cap && g_pool_cap < g_app_pool ? g_pool_cap : g_app_pool;
+}
 void s2a_app_pool_set(uint64_t v) { g_app_pool = v; }
 static void heapmode(s2a_layout *o, uint64_t b) {   // 堆模式（系统资源为 0）沿用 39 位布局；物理分配仍受应用池限制。别名区不调 MapPhysicalMemory 就不碰
     // 堆区 6 GiB；应用池比它大（Switch 2 的 9 GiB）时堆区放大到池（GiB 对齐），否则 SetHeapSize 给不满池（Pokopia 开局要约 8 GiB 堆）。别名区顺延，32 GiB 跨度内放得下

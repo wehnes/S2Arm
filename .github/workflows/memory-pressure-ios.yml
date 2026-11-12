@@ -68,6 +68,19 @@ jobs:
           fi
           grep '7 处不符' build/ci-tests/negative.log
           xcrun --sdk iphoneos clang -target arm64-apple-ios18.0 -fsyntax-only -Iruntime/include runtime/src/lowva.c
+          clang -std=gnu11 -O1 -g -Wall -Wextra -Werror -DS2A_UNIT_TEST -Iruntime/include -Iruntime/src runtime/tests/t_app_pool.c runtime/src/layout.c -o build/ci-tests/t_app_pool
+          build/ci-tests/t_app_pool > build/ci-tests/app-pool-green.log 2>&1
+          git show f2c78a8d4f96f2c9b8faa6305e7da38a855ca697:runtime/src/layout.c > build/ci-tests/layout-before.c
+          clang -std=gnu11 -O1 -g -DS2A_UNIT_TEST -Iruntime/include -Iruntime/src runtime/tests/t_app_pool.c build/ci-tests/layout-before.c -o build/ci-tests/t_app_pool_before
+          if build/ci-tests/t_app_pool_before > build/ci-tests/app-pool-negative.log 2>&1; then
+            echo 'Application pool negative control unexpectedly passed'
+            exit 1
+          fi
+          grep '16 cases, 3 failed' build/ci-tests/app-pool-negative.log
+          clang -std=gnu11 -O1 -g -DS2A_UNIT_TEST -Iruntime/include -Iruntime/src runtime/tests/t_layout.c runtime/src/layout.c -o build/ci-tests/t_layout
+          build/ci-tests/t_layout > build/ci-tests/layout.log 2>&1
+          make native-test-svc_mem > build/ci-tests/svc-mem.log 2>&1
+          xcrun --sdk iphoneos clang -target arm64-apple-ios18.0 -fsyntax-only -Iruntime/include runtime/src/layout.c
       - name: Build game-independent patched iOS shell
         run: |
           bash pack/shell_build.sh "$GITHUB_WORKSPACE/build/ci-shell" 2>&1 | tee build/ci-shell-build.log
