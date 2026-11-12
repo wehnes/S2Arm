@@ -64,7 +64,7 @@ typedef struct s2a_lowva_api {
     void (*snapshot)(uint64_t *holes, uint64_t *largest, uint64_t *reserve, uint64_t *untracked, uint64_t *tracked);
 } s2a_lowva_api;
 
-// 原生层导出，恒返回有效接口；窗口没占满（尾部还给系统 > 0）时不设限（acquire 恒 0）、不巡检，只记账
+// 原生层导出，恒返回有效接口；窗口没占满时 acquire 不设地址限额，峰值巡检仍检查支持平台的进程物理余量。
 const s2a_lowva_api *s2a_lowva(void);
 
 #ifdef __cplusplus

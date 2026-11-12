@@ -1,6 +1,6 @@
 // 低区统一记账（接口与规则见 runtime/include/s2a_lowva.h）：判定只看实时扫描，账面只用来归因。
 // 事件驱动：申请时扫；巡检线程只在占满窗口的款起，余量 < 2 × 保留量时每秒扫、否则每 10 秒扫（拦不到的分配没有事件，要有人看）；
-// 不设限的款只起峰值巡检（每 5 秒扫一次，只记宿主地址峰值）
+// 不设地址上限的款用峰值巡检；iOS 物理余量不足时同样触发腾退并加快采样。
 #include "native.h"
 #include "../include/s2a_lowva.h"
 #include <pthread.h>
@@ -9,6 +9,9 @@
 #include <unistd.h>
 #if defined(__APPLE__)
 #include <malloc/malloc.h>
+#endif
+#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
+#include <os/proc.h>
 #endif
 
 #define MB (1ull << 20)
@@ -55,6 +58,18 @@ static uint64_t g_reserve = R_MIN, g_prev_u, g_prev_ns;
 static uint64_t g_base_t; static int64_t g_base_tr; static int g_have_base;
 static struct { uint64_t ns, rise; } g_rate[NRATE]; static int g_nrate;   // 最近的单秒涨幅（相邻扫描间隔 ≥ 1 秒折算），保留量按最近 WIN_S 秒取最大
 static uint64_t g_credit, g_credit_t0, g_credit_ns;                  // 腾退回调已放掉强引用、扫描还没看到回落的字节（另一线程建管线时最多晚一次建完）
+static const uint64_t MEMORY_RESERVE = 512 * MB;
+static uint64_t g_memory_credit, g_memory_credit_ns, g_memory_previous = UINT64_MAX;
+static int g_memory_warned;
+
+// UINT64_MAX 表示平台无此读数；iOS 返回 0 时仍要处理临界压力。
+__attribute__((weak)) uint64_t s2a_lowva_memory_headroom(void) {
+#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
+    return os_proc_available_memory();
+#else
+    return UINT64_MAX;
+#endif
+}
 static int g_have_prev, g_deficit_logged, g_watch_started;
 static uint64_t g_drop_t;                                            // 骤降读数的起点（上次打读数时的 T）
 // 峰值读数（宿主在窗口外最多占过多少地址，收局 / 崩溃各打一行）：整局最低 T、最低 B 及其时刻（秒，相对第一次扫描），第一次扫描的 T 记作起点 T0。
@@ -139,7 +154,40 @@ static uint64_t evict(uint64_t want) {
     if (got) {   // 已回落的当场结清，没回落的记待回落（基准取腾后这次扫描）
         g_scan(&t1, &b); uint64_t back = t1 > t0 ? t1 - t0 : 0;
         if (got > back) { g_credit += got - back; g_credit_t0 = t1; g_credit_ns = lv_now(); } }
+    if (got) {
+        uint64_t room = MEMORY_RESERVE - g_memory_credit;
+        g_memory_credit += got < room ? got : room;
+        g_memory_credit_ns = lv_now();
+    }
     return got;
+}
+
+// 与地址空洞分开判定。只调用登记过的腾退回调，沿用其引用与 GPU 完成约束。
+// 放掉强引用到进程脚印下降可能有延迟，最多等 2 秒再重复请求同一份余量。
+static int memory_tick(void) {
+    uint64_t available = s2a_lowva_memory_headroom(), now = lv_now();
+    if (available == UINT64_MAX) {
+        g_memory_credit = 0;
+        g_memory_previous = UINT64_MAX;
+        g_memory_warned = 0;
+        return 0;
+    }
+    if (g_memory_previous != UINT64_MAX && available > g_memory_previous) {
+        uint64_t returned = available - g_memory_previous;
+        g_memory_credit -= returned < g_memory_credit ? returned : g_memory_credit;
+    }
+    g_memory_previous = available;
+    if (now - g_memory_credit_ns >= CREDIT_NS) g_memory_credit = 0;
+    uint64_t deficit = available < MEMORY_RESERVE ? MEMORY_RESERVE - available : 0;
+    if (deficit > g_memory_credit) {
+        uint64_t want = deficit - g_memory_credit, got = evict(want);
+        if (got || !g_memory_warned) {
+            LOG("进程内存余量 %llu MB：请求腾退 %llu MB，放掉引用 %llu MB（实际脚印回落待后续采样）",
+                (unsigned long long)(available / MB), (unsigned long long)(want / MB), (unsigned long long)(got / MB));
+        }
+        g_memory_warned = !got;
+    } else if (!deficit) g_memory_warned = 0;
+    return available < 2 * MEMORY_RESERVE;
 }
 
 // 申请 bytes（连续 contig）够不够：地址按 T + 待回落判；返回缺口（0 = 够），*why = 卡在地址 / 句柄
@@ -220,6 +268,7 @@ const s2a_lowva_api *s2a_lowva(void) { return &API; }
 // 巡检一拍：余量不够（按 T + 待回落）主动腾退；返回下一拍间隔秒数（余量 < 2R 时 1 秒，否则 10 秒）
 int s2a_lowva_tick(void) {
     lowva_lock();
+    int memory_low = memory_tick();
     uint64_t t, b; scan(&t, &b); uint64_t te = t + g_credit, be = b + g_credit;
     if (te < g_reserve || be < CONTIG_FLOOR) {
         uint64_t want = te < g_reserve ? g_reserve - te : 0, wb = be < CONTIG_FLOOR ? CONTIG_FLOOR - be : 0; if (wb > want) want = wb;
@@ -231,13 +280,19 @@ int s2a_lowva_tick(void) {
             te < g_reserve ? "保留量" : "连续块保底", (unsigned long long)(got / MB), (unsigned long long)(want / MB)); ledger("余量偏紧", "地址"); }
     } else g_deficit_logged = 0;
     // 余量 < 2R，或可拒绝的已过上限的一半（E > (T − R) / 2）时每秒一拍：拦不到的涨起来，申请那一刻的扫描要尽量新
-    int next = t < 2 * g_reserve || 2 * capped() > (int64_t)t - (int64_t)g_reserve ? 1 : SLOW_S;
+    int next = memory_low || t < 2 * g_reserve || 2 * capped() > (int64_t)t - (int64_t)g_reserve ? 1 : SLOW_S;
     pthread_mutex_unlock(&g_mu); return next;
 }
 static void *watch(void *a) { s2a_thread_name("s2a-lowva-watch"); (void)a; for (int s = 0;;) { int d = s2a_lowva_tick(); s += d; if (s % 30 < d) { lowva_lock(); ledger("巡检", NULL); pthread_mutex_unlock(&g_mu); } sleep((unsigned)d); } return NULL; }
-// 不设限款的峰值一拍：只扫、只记峰值（不学保留量、不打骤降、不腾退、不报红）；返回下一拍间隔秒数
+// 不设地址上限款仍检查 iOS 物理余量；地址扫描只记峰值，不学地址保留量。
 int s2a_lowva_peak_tick(void) {
-    lowva_lock(); uint64_t t, b; g_scan(&t, &b); peak_note(t, b, lv_now()); pthread_mutex_unlock(&g_mu); return PEAK_S;
+    lowva_lock();
+    int memory_low = memory_tick();
+    uint64_t t, b;
+    g_scan(&t, &b);
+    peak_note(t, b, lv_now());
+    pthread_mutex_unlock(&g_mu);
+    return memory_low ? 1 : PEAK_S;
 }
 static void *peak_watch(void *a) { s2a_thread_name("s2a-lowva-peak"); (void)a; for (;;) sleep((unsigned)s2a_lowva_peak_tick()); return NULL; }
 // 宿主地址峰值一行（收局 / 崩溃）：只 trylock 不等锁、不分配、不扫，按标签只读已存好的快照（信号处理里也调）
@@ -250,9 +305,9 @@ void s2a_lowva_peak_report(const char *when) {
         (unsigned long long)(g_pk_bmin / MB), (unsigned long long)g_pk_bmin_s, tg[0] ? tg : "（比起点低不到 64 MB，没存快照）");
     if (lk) pthread_mutex_unlock(&g_mu);
 }
-// 起局（C# 初始化后）调：窗口没占满的款不起巡检线程，只起峰值巡检（每 5 秒扫一次）
+// 起局（C# 初始化后）调：未设地址限额时用峰值巡检，iOS 物理压力下同样缩短采样间隔。
 void s2a_lowva_start(void) {
-    if (!limited()) { LOG("低区账：窗口未占满，不设限、不腾退；每 %d 秒扫一次只记宿主地址峰值", PEAK_S);
+    if (!limited()) { LOG("低区账：窗口未占满，不设地址限额；常态每 %d 秒记录峰值，并检查进程内存余量", PEAK_S);
         pthread_t th; if (!pthread_create(&th, NULL, peak_watch, NULL)) { pthread_detach(th); g_peak_watch = 1; } return; }
     lowva_lock(); ledger("起账", NULL); pthread_mutex_unlock(&g_mu);
     pthread_t th; if (!pthread_create(&th, NULL, watch, NULL)) { pthread_detach(th); g_watch_started = 1; }
@@ -261,6 +316,7 @@ void s2a_lowva_start(void) {
 void s2a_lowva_crash_note(void) { if (g_have_base) ledger("崩溃时", NULL); s2a_lowva_peak_report("崩溃"); }
 // 单测：换扫描 / 钟、清状态；查巡检线程起没起
 void s2a_lowva_test_reset(void (*sc)(uint64_t *, uint64_t *), uint64_t (*clk)(void)) {
+    g_memory_credit = g_memory_credit_ns = 0; g_memory_previous = UINT64_MAX; g_memory_warned = 0;
     g_scan = sc ? sc : s2a_low_holes; g_now = clk; memset(U, 0, sizeof U); atomic_store(&g_nuser, 0); g_reserve = R_MIN; g_prev_u = g_prev_ns = 0; g_base_t = 0; g_base_tr = 0; g_have_base = 0; g_nrate = 0;
     g_credit = g_credit_t0 = g_credit_ns = 0; g_have_prev = g_deficit_logged = g_watch_started = 0; g_drop_t = 0;
     g_pk_have = g_peak_watch = 0; g_pk_ns0 = g_pk_t0 = g_pk_tmin = g_pk_tmin_s = g_pk_bmin = g_pk_bmin_s = 0; memset(g_pk_snap, 0, sizeof g_pk_snap); atomic_store(&g_pk_cur, 0);

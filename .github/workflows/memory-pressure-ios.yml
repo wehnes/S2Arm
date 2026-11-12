@@ -1,0 +1,86 @@
+name: memory-pressure-ios
+on:
+  push:
+    branches: [debug/memory-headroom-v030]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: memory-pressure-ios-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  shell:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73
+        with:
+          global-json-file: compat/tree/global.json
+      - name: Select matching iOS SDK
+        run: |
+          python3 - <<'PY'
+          import glob, os, pathlib, subprocess
+          required = next(line.split('=', 1)[1].strip() for line in pathlib.Path('tools/toolchain.env').read_text().splitlines() if line.startswith('IPHONEOS_SDK_MAJOR='))
+          matches = []
+          for app in sorted(glob.glob('/Applications/Xcode*.app')):
+              dev = app + '/Contents/Developer'
+              result = subprocess.run(['xcrun', '--sdk', 'iphoneos', '--show-sdk-version'], env=dict(os.environ, DEVELOPER_DIR=dev), capture_output=True, text=True)
+              version = result.stdout.strip()
+              print(app, version, flush=True)
+              if result.returncode == 0 and version.split('.')[0] == required:
+                  matches.append(dev)
+          if not matches:
+              raise SystemExit('No installed Xcode matches required iOS SDK ' + required)
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write('DEVELOPER_DIR=' + matches[-1] + '\nS2A_DEVELOPER_DIR=' + matches[-1] + '\n')
+          PY
+      - name: Build tools and explicit dependency preparation
+        run: |
+          brew install bash make meson ninja pkg-config
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          echo "$pythonLocation/bin" >> "$GITHUB_PATH"
+          python3 -m pip install -r tools/rewriter-requirements.txt -r pack/fonts/requirements.txt
+          python3 runtime/rewriter/prepare_deps.py build/rewriter-deps
+          bash services/systemdata/make_tzdata.sh --prepare-sources
+          python3 pack/fonts/make_open_fonts.py "$RUNNER_TEMP/openfonts"
+          echo "S2A_SHARED_FONT_DIR=$RUNNER_TEMP/openfonts" >> "$GITHUB_ENV"
+          bash compat/fetch_base.sh
+          if ! xcrun --sdk iphoneos metal -v; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+      - name: Native regression and negative control
+        run: |
+          mkdir -p build/ci-tests
+          clang -std=gnu11 -O1 -g -DS2A_UNIT_TEST -Iruntime/include -Iruntime/src runtime/tests/t_lowva.c runtime/src/lowva.c -o build/ci-tests/t_lowva
+          build/ci-tests/t_lowva > build/ci-tests/green.log 2>&1
+          git show f2c78a8d4f96f2c9b8faa6305e7da38a855ca697:runtime/src/lowva.c > build/ci-tests/lowva-before.c
+          clang -std=gnu11 -O1 -g -DS2A_UNIT_TEST -Iruntime/include -Iruntime/src runtime/tests/t_lowva.c build/ci-tests/lowva-before.c -o build/ci-tests/t_lowva_before
+          if build/ci-tests/t_lowva_before > build/ci-tests/negative.log 2>&1; then
+            echo 'Negative control unexpectedly passed'
+            exit 1
+          fi
+          grep '7 处不符' build/ci-tests/negative.log
+          xcrun --sdk iphoneos clang -target arm64-apple-ios18.0 -fsyntax-only -Iruntime/include runtime/src/lowva.c
+      - name: Build game-independent patched iOS shell
+        run: |
+          bash pack/shell_build.sh "$GITHUB_WORKSPACE/build/ci-shell" 2>&1 | tee build/ci-shell-build.log
+          python3 pack/shell/manifest.py verify --root build/ci-shell/root --manifest build/ci-shell/manifest.json
+          ditto -c -k --keepParent build/ci-shell build/patched-shell-v0.3.0.zip
+      - name: Upload shell and checks
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-pressure-ios-shell-${{ github.run_number }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            build/patched-shell-v0.3.0.zip
+            build/ci-shell-build.log
+            build/ci-tests/*.log

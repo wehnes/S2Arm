@@ -7,6 +7,8 @@
 #define MB (1ull << 20)
 #define SEC 1000000000ull
 static uint64_t T, B, CLK; static int FDN = 40; static uint64_t FDS = 256; static uint64_t WSIZE = 64ull << 30;
+static uint64_t memory_headroom = UINT64_MAX;
+uint64_t s2a_lowva_memory_headroom(void) { return memory_headroom; }
 void s2a_low_holes(uint64_t *t, uint64_t *b) { *t = T; *b = B; }
 static int g_tags_n;   // 按标签合计被调了几次（峰值快照只在 T 创新低 ≥ 64 MB 时调）
 void s2a_low_tags(char *o, size_t n) { g_tags_n++; snprintf(o, n, "按标签：（单测桩第 %d 次）", g_tags_n); }
@@ -22,7 +24,8 @@ static uint64_t ev(void *ctx, uint64_t want) { (void)ctx; uint64_t got = 0;
     while (got < want && slices > 0) { slices--; evicted++; got += 10 * MB; if (!lag) { T += 10 * MB; B += 10 * MB; } FDN--; A->note(me, -(int64_t)(10 * MB)); }
     return got; }
 static void setup(int n) { s2a_lowva_test_reset(s2a_low_holes, clk); A = s2a_lowva(); me = A->user("管线归档", ev, NULL);
-    slices = n; evicted = 0; lag = 0; CLK = SEC; for (int i = 0; i < n; i++) A->note(me, 10 * MB); }   // 预置的片只记账、不走申请（申请会按当时余量腾）
+    slices = n; evicted = 0; lag = 0; CLK = SEC; memory_headroom = UINT64_MAX;
+    for (int i = 0; i < n; i++) A->note(me, 10 * MB); }   // 预置的片只记账、不走申请（申请会按当时余量腾）
 static volatile int g_noted;
 static void *note_th(void *a) { (void)a; A->note(me, 10 * MB); g_noted = 1; return NULL; }
 static int bad;
@@ -174,6 +177,31 @@ int main(void) {
       CK(u == 264 * MB && r == 528 * MB && ok == 20, "㉓ 拦不到 264、R 528 时 20 次 contig 0 申请应全放（拦不到 %llu、R %llu、放 %d）",
          (unsigned long long)(u / MB), (unsigned long long)(r / MB), ok);
       CK(A->acquire(ca, 5 * MB, 5 * MB, 1, "㉓ 要连续") == -1, "㉓ 同状态下要连续的 5 MB 无人可腾应拒"); FDN = 40; }
+    // 物理余量与地址空洞独立：512 MiB 保留量，452 MiB 可用应腾 60 MiB。
+    T = 5000 * MB; B = 2000 * MB; setup(10); memory_headroom = 452 * MB;
+    iv = s2a_lowva_tick();
+    CK(evicted == 6 && iv == 1, "物理余量 452 MiB 应腾 60 MiB、每秒巡检（%d、%d）", evicted, iv);
+    CLK += SEC; memory_headroom = 482 * MB; s2a_lowva_tick();
+    CK(evicted == 6, "回落 30 MiB、仍待回落 30 MiB 时不应重复腾退（%d）", evicted);
+    CLK += 2 * SEC; s2a_lowva_tick();
+    CK(evicted == 9, "待回落过期仍差 30 MiB 时应再腾 3 片（%d）", evicted);
+    T = 5000 * MB; B = 2000 * MB; FDN = 100; setup(60); memory_headroom = 0;
+    s2a_lowva_tick();
+    CK(evicted == 52, "物理余量为零是有效读数，应腾至少 512 MiB（%d）", evicted);
+    FDN = 40;
+    T = 5000 * MB; B = 2000 * MB; setup(10); memory_headroom = 512 * MB;
+    s2a_lowva_tick(); CK(evicted == 0, "达到物理保留量时不应腾退（%d）", evicted);
+    T = 5000 * MB; B = 2000 * MB; setup(0); memory_headroom = 100 * MB;
+    CK(s2a_lowva_tick() == 1, "无可腾资源时仍应每秒观察物理余量");
+    WSIZE = 32ull << 30; T = 5000 * MB; B = 2000 * MB; setup(10);
+    memory_headroom = 452 * MB; iv = s2a_lowva_peak_tick();
+    CK(evicted == 6 && iv == 1, "不设地址上限的峰值巡检也应处理物理压力（%d、%d）", evicted, iv);
+    memory_headroom = UINT64_MAX; iv = s2a_lowva_peak_tick();
+    CK(evicted == 6 && iv == 5, "物理余量未知时恢复原峰值巡检间隔（%d、%d）", evicted, iv);
+    WSIZE = 64ull << 30; FDN = 40; T = 200 * MB; B = 2000 * MB; setup(10);
+    memory_headroom = 452 * MB; s2a_lowva_tick();
+    CK(evicted == 6 && T == 260 * MB, "物理与地址同时不足时，同一批腾退应满足两者（%d）", evicted);
+    FDN = 40;
     // ⑫ 不占满窗口（尾部已还给系统）：不设限（T 100 也直接过）、起账不起巡检线程，只起峰值巡检
     WSIZE = 32ull << 30; T = 100 * MB; B = 50 * MB; setup(3);
     CK(A->acquire(me, 10 * MB, 10 * MB, 1, "⑫") == 0 && evicted == 0, "⑫ 窗口未占满应不设限（腾 %d 片）", evicted);
