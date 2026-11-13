@@ -2,12 +2,14 @@
 // Copyright 2026 S2Arm contributors
 #include "../src/native.h"
 #include <sys/wait.h>
+#include <stdatomic.h>
 
 #define MB (1ull << 20)
 #define GB (1ull << 30)
 #define NATIVE_SWITCH 0xCD500000ull
 static uint64_t process_limit;
-uint64_t s2a_app_pool_process_limit(void) { return process_limit; }
+static _Atomic int provider_calls;
+uint64_t s2a_app_pool_process_limit(void) { atomic_fetch_add(&provider_calls, 1); return process_limit; }
 static int failed;
 #define EQ(a, b) do { uint64_t actual_ = (a), expected_ = (b); if (actual_ != expected_) { fprintf(stderr, "%s = %llu, expected %llu\n", #a, (unsigned long long)actual_, (unsigned long long)expected_); failed++; } } while (0)
 
@@ -19,8 +21,20 @@ typedef struct {
     uint64_t expected_switch2;
 } budget_case;
 
+static void *read_pool(void *expected) {
+    return (void *)(uintptr_t)(s2a_app_pool() != *(uint64_t *)expected);
+}
+
 static int check(const budget_case *item) {
     process_limit = item->limit;
+    pthread_t readers[8]; uint64_t expected = item->expected_switch;
+    for (unsigned index = 0; index < 8; index++) if (pthread_create(&readers[index], NULL, read_pool, &expected)) return 1;
+    for (unsigned index = 0; index < 8; index++) {
+        void *result;
+        if (pthread_join(readers[index], &result)) return 1;
+        EQ((uintptr_t)result, 0);
+    }
+    EQ(atomic_load(&provider_calls) > 1, 0);
     EQ(s2a_app_pool(), item->expected_switch);
     s2a_app_pool_set(9 * GB);
     EQ(s2a_app_pool(), item->expected_switch2);
@@ -39,7 +53,9 @@ static int check(const budget_case *item) {
     setenv("S2A_APP_POOL_MB", "4096", 1);
     setenv("S2A_APP_POOL_RESERVE_MB", "0", 1);
     process_limit = 16 * GB;
+    int calls = atomic_load(&provider_calls);
     EQ(s2a_app_pool(), item->expected_switch2);
+    EQ(atomic_load(&provider_calls), calls);
     s2a_app_pool_set(NATIVE_SWITCH);
     EQ(s2a_app_pool(), item->expected_switch);
     s2a_app_pool_set(9 * GB);

@@ -33,7 +33,7 @@ jobs:
           fi
           clang -std=gnu11 -O1 -g -Wall -Wextra -Werror -DS2A_UNIT_TEST -Iruntime/include -Iruntime/src runtime/tests/t_app_pool.c runtime/src/layout.c -o build/ci-tests/t_app_pool
           build/ci-tests/t_app_pool > build/ci-tests/budget-green.log 2>&1
-          make native-test-layout native-test-svc_mem native-test-app_pool_svc > build/ci-tests/native.log 2>&1
+          make native-test-layout native-test-svc_mem native-test-app_pool_svc native-test-ios_guest_budget > build/ci-tests/native.log 2>&1
           clang -std=gnu11 -O1 -g -DS2A_UNIT_TEST -Iruntime/include -Iruntime/src runtime/tests/t_app_pool_svc.c build/ci-tests/svc-before.c build/ci-tests/layout-before.c build/tests/libs2a_vaguard.dylib -o build/tests/t_app_pool_svc_before
           if build/tests/t_app_pool_svc_before > build/ci-tests/svc-red.log 2>&1; then
             echo 'SVC negative control unexpectedly passed'
@@ -42,10 +42,19 @@ jobs:
           clang -std=gnu11 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -DS2A_UNIT_TEST -Iruntime/include -Iruntime/src runtime/tests/t_app_pool.c runtime/src/layout.c -o build/ci-tests/t_app_pool_sanitized
           build/ci-tests/t_app_pool_sanitized > build/ci-tests/sanitized.log 2>&1
           xcrun --sdk iphoneos clang -target arm64-apple-ios18.0 -fsyntax-only -Iruntime/include runtime/src/layout.c runtime/src/svc_mem.c > build/ci-tests/ios-syntax.log 2>&1
+          xcrun --sdk iphoneos clang -target arm64-apple-ios18.0 -fsyntax-only ios/guest_budget.m >> build/ci-tests/ios-syntax.log 2>&1
+      - name: Contributor first-layer check
+        continue-on-error: true
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          bash tools/contrib_check.sh --base 8258fca5e9268078f5b8253b32336c4693d54bc1 > build/ci-tests/contrib.log 2>&1
       - name: Upload checks
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: guest-memory-budget-checks
           retention-days: 7
-          path: build/ci-tests/*.log
+          path: |
+            build/ci-tests/*.log
+            build/contrib_check/summary.md

@@ -430,6 +430,12 @@ uint64_t s2a_mem_init(const char *npdm) {
     uint32_t t, ms; uint64_t sr; uint64_t wb, ws;
     if (npdm_read(npdm, &t, &sr, &ms, &g_program_id, 1)) die("读不到 NPDM：%s", npdm);
     if (!g_program_id) die("NPDM 里没有 ACI0 程序号：%s", npdm);
+    uint64_t native_pool = g_npdm_ounce ? 0x240000000ull : 0xCD500000ull;
+    if (APP_POOL < native_pool && !phys_limit_on()) {
+        LOG("【红】缩小客体预算需要物理池核算，请移除 S2A_PHYS_LIMIT=0 后重开");
+        s2a_init_failed(S2A_INIT_FAIL_E_DEVICE_ADDRESS);
+        die("实验客体预算与旧版核算开关冲突（没链宿主的失败出口）");
+    }
     uint64_t fixed = code_bytes() + sr + (((uint64_t)ms + 0xfff) & ~0xfffull);
     if (fixed > APP_POOL) {
         LOG("【红】客体应用池预算不足：池 %llu MiB、代码与主线程栈及系统资源至少需 %llu MiB", (unsigned long long)(APP_POOL >> 20), (unsigned long long)((fixed + (1ull << 20) - 1) >> 20));

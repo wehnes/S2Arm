@@ -5,10 +5,6 @@
 #include "native.h"
 #include "as_type.h"
 #include <errno.h>
-#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
-#include <mach/mach.h>
-#include <os/proc.h>
-#endif
 
 #define GB (1ull << 30)
 #define MB (1ull << 20)
@@ -48,15 +44,7 @@ static uint64_t g_pool_cap = UINT64_MAX;
 // UINT64_MAX means unavailable. A measured zero is a valid exhausted limit.
 // The weak provider lets host tests cover device limits without iOS hardware.
 __attribute__((weak)) uint64_t s2a_app_pool_process_limit(void) {
-#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
-    task_vm_info_data_t info; mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
-    uint64_t available = os_proc_available_memory();
-    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) != KERN_SUCCESS || available > UINT64_MAX - info.phys_footprint)
-        return UINT64_MAX;
-    return available + info.phys_footprint;
-#else
     return UINT64_MAX;
-#endif
 }
 
 static int pool_mb(const char *value, uint64_t *bytes) {
