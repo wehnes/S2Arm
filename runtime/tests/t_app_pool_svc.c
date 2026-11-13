@@ -63,6 +63,6 @@ int main(void) {
         int status;
         if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status)) failures++;
     }
-    printf("Application budget SVC: %zu cases, %d failed\n", sizeof cases / sizeof *cases, failures);
+    printf("%s t_app_pool_svc：%zu cases, %d failed\n", failures ? "✗" : "✓", sizeof cases / sizeof *cases, failures);
     return failures != 0;
 }

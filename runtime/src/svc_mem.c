@@ -303,7 +303,7 @@ static uint64_t pool_fixed(void) { return phys_limit_on() ? code_bytes() + g_mst
 static uint64_t mask_minmax(uint32_t lo, uint32_t hi) { uint32_t r = hi - lo + 1; return r >= 64 ? ~0ull : ((1ull << r) - 1) << lo; }
 // apply = 0（s2a_npdm_window_need 量窗口跨度）：不写本局专属的 NPDM 状态（优先级 / 缺省核 / 核与优先级掩码 / 系统调用许可）——
 //   多款容器构造期要逐款读包内每一款的 NPDM（runtime/src/vawin.c），许可位是按位或累加的，读了别款就混进本局。本局的状态由起局时 layout_prepare / s2a_mem_init 按 apply = 1 读。
-//   Switch 2 标志与应用池两种都设（标志是赋值、起局 layout_prepare 按本款重写；池 9 GiB 不回设，容器逐款算完由 vawin.c 放回）：
+//   Switch 2 标志与原生应用池每次都按本款设置；容器逐款算完由 vawin.c 放回计算前的原生池：
 //   窗口跨度按池算堆区（layout.c S2A_HEAP_DEFAULT），单款构造期的客体内存文件后备判定也读它（vawin.c guest_file_attach）
 static int npdm_read(const char *path, uint32_t *as_type, uint64_t *sysres, uint32_t *main_stack, uint64_t *pid, int apply) {
     FILE *f = fopen(path, "rb"); if (!f) return -1;
@@ -317,7 +317,7 @@ static int npdm_read(const char *path, uint32_t *as_type, uint64_t *sysres, uint
     // Switch 2（Ounce）的 ACID 用 RSA-3072 签名：签名 / 公钥各 0x180，魔数在 ACID +0x300（Switch 1 +0x200；switchbrew NPDM）。按它认 Switch 2 进程
     { uint32_t acid; uint8_t mg[4]; memcpy(&acid, meta + 0x78, 4);
       g_npdm_ounce = !fseek(f, (long)acid + 0x300, SEEK_SET) && fread(mg, 1, 4, f) == 4 && !memcmp(mg, "ACID", 4);
-      if (g_npdm_ounce) s2a_app_pool_set(0x240000000ull); }   // Switch 2：应用池 9 GiB（native.h S2A_APP_POOL）；起局第一次读 NPDM（窗口量跨度）就设，布局之前
+      s2a_app_pool_set(g_npdm_ounce ? 0x240000000ull : 0xCD500000ull); }   // 原生池按本款 NPDM 选，再由 layout.c 应用实验上限
     uint8_t a[0x38]; *pid = 0;
     if (!fseek(f, aci, SEEK_SET) && fread(a, 1, sizeof a, f) == sizeof a && !memcmp(a, "ACI0", 4)) {
         uint32_t ko, ks; memcpy(pid, a + 0x10, 8); memcpy(&ko, a + 0x30, 4); memcpy(&ks, a + 0x34, 4);

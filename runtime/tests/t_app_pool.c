@@ -118,6 +118,6 @@ int main(void) {
             failed++;
         }
     }
-    printf("Application budget: %zu cases, %d failed\n", sizeof cases / sizeof *cases, failed);
+    printf("%s t_app_pool：%zu cases, %d failed\n", failed ? "✗" : "✓", sizeof cases / sizeof *cases, failed);
     return failed != 0;
 }

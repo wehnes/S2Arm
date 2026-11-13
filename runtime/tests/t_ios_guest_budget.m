@@ -36,6 +36,6 @@ int main(void) {
             failed++;
         }
     }
-    printf("iOS budget provider: 6 cases, %d failed\n", failed);
+    printf("%s t_ios_guest_budget：6 cases, %d failed\n", failed ? "✗" : "✓", failed);
     return failed != 0;
 }

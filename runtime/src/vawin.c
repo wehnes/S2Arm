@@ -570,7 +570,8 @@ uint64_t s2a_window_container_need(const char *bundle) {
     int (*span)(const char *, char *, size_t) = (int (*)(const char *, char *, size_t))dlsym(RTLD_DEFAULT, "s2a_loader_span_images");
     uint64_t (*poolf)(void) = (uint64_t (*)(void))dlsym(RTLD_DEFAULT, "s2a_app_pool");
     void (*pools)(uint64_t) = (void (*)(uint64_t))dlsym(RTLD_DEFAULT, "s2a_app_pool_set");
-    uint64_t pool0 = poolf ? poolf() : 0, top = 0, span_max = 0; int n = 0, ast = -1, ok = 1, span_unknown = 0; char first[256] = ""; struct dirent *e;
+    uint64_t (*native_pool)(void) = (uint64_t (*)(void))dlsym(RTLD_DEFAULT, "s2a_app_pool_native");
+    uint64_t pool0 = native_pool ? native_pool() : poolf ? poolf() : 0, top = 0, span_max = 0; int n = 0, ast = -1, ok = 1, span_unknown = 0; char first[256] = ""; struct dirent *e;
     while (ok && (e = readdir(d))) {
         char dir[1400], img[1400], why[400] = ""; struct stat st;
         if (e->d_name[0] == '.' || strlen(e->d_name) > 200) continue;
