@@ -82,6 +82,7 @@ uint64_t s2a_app_pool(void) {
     pthread_once(&g_pool_once, app_pool_config);
     return g_app_pool < g_pool_cap ? g_app_pool : g_pool_cap;
 }
+uint64_t s2a_app_pool_native(void) { return g_app_pool; }
 void s2a_app_pool_set(uint64_t v) { g_app_pool = v; }
 static void heapmode(s2a_layout *o, uint64_t b) {   // 堆模式（系统资源为 0）沿用 39 位布局；物理分配仍受应用池限制。别名区不调 MapPhysicalMemory 就不碰
     // 堆区 6 GiB；应用池比它大（Switch 2 的 9 GiB）时堆区放大到池（GiB 对齐），否则 SetHeapSize 给不满池（Pokopia 开局要约 8 GiB 堆）。别名区顺延，32 GiB 跨度内放得下

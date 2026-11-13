@@ -5,6 +5,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: guest-memory-budget-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   native:
     runs-on: xcode-27
@@ -32,6 +35,7 @@ jobs:
         run: |
           mkdir -p build/ci-tests
           git show 8258fca5e9268078f5b8253b32336c4693d54bc1:runtime/src/layout.c > build/ci-tests/layout-before.c
+          printf '\nuint64_t s2a_app_pool_native(void) { return s2a_app_pool(); }\n' >> build/ci-tests/layout-before.c
           git show 8258fca5e9268078f5b8253b32336c4693d54bc1:runtime/src/svc_mem.c > build/ci-tests/svc-before.c
           clang -std=gnu11 -O1 -g -DS2A_UNIT_TEST -Iruntime/include -Iruntime/src runtime/tests/t_app_pool.c build/ci-tests/layout-before.c -o build/ci-tests/t_app_pool_before
           if build/ci-tests/t_app_pool_before > build/ci-tests/budget-red.log 2>&1; then

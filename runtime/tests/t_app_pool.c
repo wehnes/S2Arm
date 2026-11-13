@@ -9,6 +9,7 @@
 #define NATIVE_SWITCH 0xCD500000ull
 static uint64_t process_limit;
 static _Atomic int provider_calls;
+uint64_t s2a_app_pool_native(void);
 uint64_t s2a_app_pool_process_limit(void) { atomic_fetch_add(&provider_calls, 1); return process_limit; }
 static int failed;
 #define EQ(a, b) do { uint64_t actual_ = (a), expected_ = (b); if (actual_ != expected_) { fprintf(stderr, "%s = %llu, expected %llu\n", #a, (unsigned long long)actual_, (unsigned long long)expected_); failed++; } } while (0)
@@ -37,6 +38,7 @@ static int check(const budget_case *item) {
     EQ(atomic_load(&provider_calls) > 1, 0);
     EQ(s2a_app_pool(), item->expected_switch);
     s2a_app_pool_set(9 * GB);
+    EQ(s2a_app_pool_native(), 9 * GB);
     EQ(s2a_app_pool(), item->expected_switch2);
     EQ(S2A_HEAP_DEFAULT, item->expected_switch2 & ~(2 * MB - 1));
     s2a_layout layout; uint64_t module, shadow;
@@ -57,6 +59,7 @@ static int check(const budget_case *item) {
     EQ(s2a_app_pool(), item->expected_switch2);
     EQ(atomic_load(&provider_calls), calls);
     s2a_app_pool_set(NATIVE_SWITCH);
+    EQ(s2a_app_pool_native(), NATIVE_SWITCH);
     EQ(s2a_app_pool(), item->expected_switch);
     s2a_app_pool_set(9 * GB);
     EQ(s2a_app_pool(), item->expected_switch2);

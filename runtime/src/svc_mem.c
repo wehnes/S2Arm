@@ -40,6 +40,7 @@ static uint64_t memory_protection_page(void) {
 #endif
 }
 #define APP_POOL S2A_APP_POOL         // 应用内存池 = Switch 3285 MB / Switch 2 9 GiB（native.h）；SetHeapSize 上限 = 池 − 映像
+uint64_t s2a_app_pool_native(void);   // layout.c：NPDM 选择的原生池，未应用实验限额
 enum { ST_FREE = 0, ST_CODE = 3, ST_CODEDATA = 4, ST_HEAP = 5, ST_SHARED = 6, ST_STACK = 0x0B, ST_THREADLOCAL = 0x0C, ST_TMEM_ISO = 0x0D, ST_TMEM = 0x0E, ST_INACCESSIBLE = 0x10,
        ST_CODE_RO = 0x14, ST_CODE_RW = 0x15 };
 
@@ -430,7 +431,7 @@ uint64_t s2a_mem_init(const char *npdm) {
     uint32_t t, ms; uint64_t sr; uint64_t wb, ws;
     if (npdm_read(npdm, &t, &sr, &ms, &g_program_id, 1)) die("读不到 NPDM：%s", npdm);
     if (!g_program_id) die("NPDM 里没有 ACI0 程序号：%s", npdm);
-    uint64_t native_pool = g_npdm_ounce ? 0x240000000ull : 0xCD500000ull;
+    uint64_t native_pool = s2a_app_pool_native();
     if (APP_POOL < native_pool && !phys_limit_on()) {
         LOG("【红】缩小客体预算需要物理池核算，请移除 S2A_PHYS_LIMIT=0 后重开");
         s2a_init_failed(S2A_INIT_FAIL_E_DEVICE_ADDRESS);
