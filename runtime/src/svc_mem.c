@@ -372,6 +372,10 @@ static void layout_prepare(const char *npdm) {
     g_lay_need = s2a_layout_need(t, sr, mod);
     int alias_gb = alias_first_hint(npdm, pid);
     int rc = s2a_layout_compute(t, sr, mod, alias_gb, wb, ws, &L, &g_mod_base, &g_shadow_base);
+    if (rc == -3) {
+        s2a_init_failed(S2A_INIT_FAIL_E_DEVICE_ADDRESS);
+        die("客体应用池预算不足或配置无效（没链宿主的失败出口）");
+    }
     if (rc == -1) die("【红】NPDM 地址空间类型 %u（%s）暂不支持（布局只支持类型 1 = 36 位、3 = 39 位）", t, s2a_as_type_bits(t));
     if (rc == -2) {   // 窗口按学到的跨度收窄了（#783）：当场放宽回缺省给法、重算一次（vawin.c；安卓 / 单测没有这个就不调）
         int (*widen)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "s2a_window_span_widen");
@@ -426,6 +430,12 @@ uint64_t s2a_mem_init(const char *npdm) {
     uint32_t t, ms; uint64_t sr; uint64_t wb, ws;
     if (npdm_read(npdm, &t, &sr, &ms, &g_program_id, 1)) die("读不到 NPDM：%s", npdm);
     if (!g_program_id) die("NPDM 里没有 ACI0 程序号：%s", npdm);
+    uint64_t fixed = code_bytes() + sr + (((uint64_t)ms + 0xfff) & ~0xfffull);
+    if (fixed > APP_POOL) {
+        LOG("【红】客体应用池预算不足：池 %llu MiB、代码与主线程栈及系统资源至少需 %llu MiB", (unsigned long long)(APP_POOL >> 20), (unsigned long long)((fixed + (1ull << 20) - 1) >> 20));
+        s2a_init_failed(S2A_INIT_FAIL_E_DEVICE_ADDRESS);
+        die("客体应用池放不下启动所需页面（没链宿主的失败出口）");
+    }
     if (!g_core_mask || !g_prio_mask) die("NPDM 内核能力里没有 ThreadInfo 项（核 / 优先级掩码）：%s", npdm);
     layout_prepare(npdm); wb = L.win_base; ws = L.win_size;
 #ifdef __ANDROID__
@@ -2061,8 +2071,12 @@ static int svc_mem_impl(int num, uint64_t *regs, uint64_t orig) {
             if ((uint64_t)sub > 3) { regs[0] = 0xE801; regs[1] = 0; return 1; }
             // 4 GB 机型的内存区（Ryujinx KSystemControl / KernelInit）：应用 3285 MiB、小程序 507 MiB、系统服务约 251 MiB（上游注释量级，取决于内核保留区，近似）、
             //   nv 服务 (0x2238 + 0x710 + 0x80) × 4 KB。只有应用区按实际记账算空闲；其余三区游戏碰不到，空闲按总量报
-            static const uint64_t total[4] = {3285ull << 20, 507ull << 20, 251ull << 20, (0x2238ull + 0x710 + 0x80) << 12};
-            v = id == 0 ? total[sub] : sub == 0 ? (APP_POOL > mem_used() ? APP_POOL - mem_used() : 0) : total[sub];
+            static const uint64_t total[4] = {0, 507ull << 20, 251ull << 20, (0x2238ull + 0x710 + 0x80) << 12};
+            v = total[sub];
+            if (sub == 0) {
+                uint64_t pool = APP_POOL, used = id ? mem_used() : 0;
+                v = used < pool ? pool - used : 0;
+            }
         } else {
             if ((uint64_t)sub > 1) { regs[0] = 0xE801; regs[1] = 0; return 1; }
             v = sub == 0 ? 1 : 8;   // 特权进程号范围：Ryujinx KernelContext.PrivilegedProcessLowestId / HighestId
