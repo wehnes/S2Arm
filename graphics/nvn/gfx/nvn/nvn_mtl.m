@@ -3070,13 +3070,120 @@ static void up_diag(void) {
          (unsigned long long)g_up_blocks_new, (unsigned long long)g_up_swaps, (unsigned long long)(g_up_swap_bytes >> 20), (unsigned long long)g_up_cap_flushes, alive, (unsigned long long)(abytes >> 20), inres, (unsigned long long)(g_dev.currentAllocatedSize >> 20), nres, ndef);
     }
 }
+// Diagnostic-only fork: observe the first failed private upload allocation, then preserve MDIE.
+// No recovery, no residency insertion, no GPU command submission/wait, no guest-budget change.
+static void up_fail_vm(const char *phase) {
+    task_vm_info_data_t t = {0}; mach_msg_type_number_t tc = TASK_VM_INFO_COUNT;
+    kern_return_t tk = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&t, &tc);
+    vm_statistics64_data_t v = {0}; mach_msg_type_number_t vc = HOST_VM_INFO64_COUNT;
+    mach_port_t host = mach_host_self();
+    kern_return_t vk = host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&v, &vc);
+    mach_port_deallocate(mach_task_self(), host);
+    unsigned long long avail = 0;
+#if TARGET_OS_IPHONE
+    avail = (unsigned long long)os_proc_available_memory();
+#endif
+    MLOG("[up_fail_diag] vm phase=%s task_kr=%d task_count=%u footprint=%llu resident=%llu virtual=%llu internal=%llu compressed=%llu available=%llu host_kr=%d page_size=%u free_pages=%llu active_pages=%llu inactive_pages=%llu wired_pages=%llu compressor_pages=%llu speculative_pages=%llu",
+         phase, tk, tc, (unsigned long long)t.phys_footprint, (unsigned long long)t.resident_size, (unsigned long long)t.virtual_size,
+         (unsigned long long)t.internal, (unsigned long long)t.compressed, avail, vk, (unsigned)vm_page_size,
+         (unsigned long long)v.free_count, (unsigned long long)v.active_count, (unsigned long long)v.inactive_count,
+         (unsigned long long)v.wire_count, (unsigned long long)v.compressor_page_count, (unsigned long long)v.speculative_count);
+}
+// A raw VM-region scan, NOT a claim of GPU-mappable address capacity. The existing runtime
+// scan additionally excludes its guest window; use its read-only function if exported.
+static void up_fail_holes(size_t n) {
+    void (*low)(uint64_t *, uint64_t *) = (void (*)(uint64_t *, uint64_t *))dlsym(RTLD_DEFAULT, "s2a_low_holes");
+    if (low) { uint64_t t = 0, b = 0; low(&t, &b); MLOG("[up_fail_diag] runtime_holes total=%llu largest=%llu", (unsigned long long)t, (unsigned long long)b); }
+    else MLOG("[up_fail_diag] runtime_holes unavailable; use native crash address ledger");
+    uint64_t (*topfn)(void) = (uint64_t (*)(void))dlsym(RTLD_DEFAULT, "s2a_va_top");
+    uint64_t top = topfn ? topfn() : 0, hi = 1ull << 39;
+    if (top && top < hi) hi = top;
+    uint64_t prev = 1ull << 32, total = 0, largest = 0, fit = 0, fit2m = 0, fit32m = 0;
+    unsigned regions = 0, holes = 0; kern_return_t kr = KERN_SUCCESS;
+    while (prev < hi && regions < 65536) {
+        vm_address_t a = (vm_address_t)prev; vm_size_t sz = 0;
+        vm_region_basic_info_data_64_t info; mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj = MACH_PORT_NULL;
+        kr = vm_region_64(mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &obj);
+        if (MACH_PORT_VALID(obj)) mach_port_deallocate(mach_task_self(), obj);
+        if (kr != KERN_SUCCESS && kr != KERN_INVALID_ADDRESS) break;
+        uint64_t end = kr == KERN_SUCCESS && a < hi ? a : hi;
+        if (end > prev) {
+            uint64_t len = end - prev, a2 = (prev + ((1ull << 21) - 1)) & ~((1ull << 21) - 1), a32 = (prev + ((1ull << 25) - 1)) & ~((1ull << 25) - 1);
+            holes++; total += len; if (len > largest) largest = len;
+            fit += len >= n; fit2m += a2 < end && end - a2 >= n; fit32m += a32 < end && end - a32 >= n;
+        }
+        if (kr != KERN_SUCCESS || a >= hi) { prev = hi; break; }
+        uint64_t next = (uint64_t)a + sz;
+        if (next <= prev) break;
+        prev = next; regions++;
+    }
+    MLOG("[up_fail_diag] raw_va top_known=%d scan_end=%#llx complete=%d kr=%d regions=%u holes=%u total=%llu largest=%llu fit=%llu fit_2m_align=%llu fit_32m_align=%llu requested=%zu (raw gaps may include guest/reserved address space)",
+         top != 0, (unsigned long long)hi, prev >= hi, kr, regions, holes, (unsigned long long)total, (unsigned long long)largest,
+         (unsigned long long)fit, (unsigned long long)fit2m, (unsigned long long)fit32m, n);
+}
+static void up_fail_probe(const char *label, size_t n, MTLResourceOptions options) {
+    const size_t cap = 64u << 20;
+    if (!n || n > cap || n > g_dev.maxBufferLength) { MLOG("[up_fail_diag] probe=%s bytes=%zu skipped=length_cap", label, n); return; }
+#if TARGET_OS_IPHONE
+    size_t avail = os_proc_available_memory();
+    if (avail < n + (16u << 20)) { MLOG("[up_fail_diag] probe=%s bytes=%zu skipped=process_headroom available=%zu", label, n, avail); return; }
+#endif
+    MLOG("[up_fail_diag] probe=%s begin bytes=%zu storage=%lu", label, n, (unsigned long)options);
+    unsigned long long before = g_dev.currentAllocatedSize, during = before;
+    int ok = 0; uint64_t start = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    @autoreleasepool {
+        id<MTLBuffer> b = [g_dev newBufferWithLength:n options:options];
+        ok = b != nil; during = g_dev.currentAllocatedSize;
+        b = nil;
+    }
+    MLOG("[up_fail_diag] probe=%s result=%s bytes=%zu elapsed_us=%llu gpu_before=%llu gpu_during=%llu gpu_after=%llu",
+         label, ok ? "ok" : "nil", n, (unsigned long long)((clock_gettime_nsec_np(CLOCK_MONOTONIC) - start) / 1000),
+         before, during, (unsigned long long)g_dev.currentAllocatedSize);
+}
+static void up_alloc_failed(const char *site, size_t want, size_t payload, size_t aligned) {
+    const char *enabled = getenv("DM_NVN_UPLOAD_DIAG");
+    if (enabled && !strcmp(enabled, "0")) return;
+    static _Atomic int once;
+    if (atomic_exchange(&once, 1)) return;
+    MLOG("[up_fail_diag] begin v=1 site=%s request=%zu payload=%zu aligned=%zu m3=%d slot=%u seq=%u pending=%d busy=%d/%d/%d open_batch=%d block_off=%zu block_size=%zu kept_bytes=%llu kept_count=%lu blits=%d textures=%lu new_blocks=%llu swaps=%llu",
+         site, want, payload, aligned, g_m3, g_up_cur_slot, g_up_seq, atomic_load(&g_up_pending),
+         atomic_load(&g_up_alloc_busy[0]), atomic_load(&g_up_alloc_busy[1]), atomic_load(&g_up_alloc_busy[2]), g_up_cb != nil,
+         g_up_block_off, g_up_block_size, (unsigned long long)g_up_keep_bytes, (unsigned long)g_up_keep.count,
+         g_nup_blits, (unsigned long)g_up_texs.count, (unsigned long long)g_up_blocks_new, (unsigned long long)g_up_swaps);
+    // Count only; never enumerate weak tables or take a blocking renderer lock on this path.
+    long res = -1, deferred = -1;
+    if (!pthread_mutex_trylock(&g_res_mu)) { res = (long)g_res_objects.count; pthread_mutex_unlock(&g_res_mu); }
+    if (!pthread_mutex_trylock(&g_deferred_mu)) { deferred = (long)g_deferred.count; pthread_mutex_unlock(&g_deferred_mu); }
+    unsigned long long recommended = 0;
+    if (@available(iOS 16.0, macOS 10.12, *)) recommended = g_dev.recommendedMaxWorkingSetSize;
+    MLOG("[up_fail_diag] gpu allocated=%llu recommended=%llu max_buffer=%llu residency_count=%ld deferred_count=%ld slot_bytes=%llu/%llu/%llu",
+         (unsigned long long)g_dev.currentAllocatedSize, recommended, (unsigned long long)g_dev.maxBufferLength, res, deferred,
+         (unsigned long long)g_up_slot_blk[0].length, (unsigned long long)g_up_slot_blk[1].length, (unsigned long long)g_up_slot_blk[2].length);
+    up_fail_vm("before");
+    up_fail_holes(want);
+    // Address reservation only: no writes, no wired pages, never MAP_FIXED.
+    if (want && want <= (64u << 20)) {
+        MLOG("[up_fail_diag] probe=cpu_reserve begin bytes=%zu", want);
+        errno = 0; void *p = mmap(NULL, want, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        int err = p == MAP_FAILED ? errno : 0, released = -1;
+        if (p != MAP_FAILED) released = munmap(p, want);
+        MLOG("[up_fail_diag] probe=cpu_reserve result=%s bytes=%zu errno=%d release_rc=%d (no page touch)", p == MAP_FAILED ? "fail" : "ok", want, err, released);
+    } else MLOG("[up_fail_diag] probe=cpu_reserve skipped=length_cap bytes=%zu", want);
+    up_fail_probe("private_64k", 64u << 10, MTLResourceStorageModePrivate);
+    up_fail_probe("private_4m", 4u << 20, MTLResourceStorageModePrivate);
+    up_fail_probe("shared_same", want, MTLResourceStorageModeShared);
+    up_fail_probe("private_same_repeat", want, MTLResourceStorageModePrivate);
+    up_fail_vm("after");
+    MLOG("[up_fail_diag] end; original fatal follows");
+}
+
 static id<MTLBuffer> up_alloc(size_t n, size_t *off) {
     size_t need = (n + 255u) & ~((size_t)255u);
     if (!g_up_block && need <= UP_BLOCK_SIZE) {   // first allocation of the batch: the slot's own block, grown to the next power of two that holds it (a movie frame re-uploaded every frame, 8 MB in Link's Awakening)
         __strong id<MTLBuffer> *sb = &g_up_slot_blk[g_up_cur_slot];
         size_t want = UP_SLOT_BLOCK; while (want < need) want <<= 1;
         if (*sb && (*sb).length < want) { defer_obj_release(*sb); *sb = nil; }   // the slot's previous batch has finished (up_begin waited for it)
-        if (!*sb) { *sb = [g_dev newBufferWithLength:want options:MTLResourceStorageModePrivate]; if (!*sb) MDIE("failed to create the swizzled-upload staging block %#zx", want); res_add(*sb); g_up_blocks_new++; }
+        if (!*sb) { *sb = [g_dev newBufferWithLength:want options:MTLResourceStorageModePrivate]; if (!*sb) { up_alloc_failed("slot", want, n, need); MDIE("failed to create the swizzled-upload staging block %#zx", want); } res_add(*sb); g_up_blocks_new++; }
         g_up_block = *sb; g_up_block_size = (*sb).length; g_up_block_off = 0;
     }
     if (!g_up_block || g_up_block_off + need > g_up_block_size) {
@@ -3087,7 +3194,7 @@ static id<MTLBuffer> up_alloc(size_t n, size_t *off) {
             if (!leak && g_up_block != g_up_slot_blk[g_up_cur_slot]) up_keep_add(g_up_block); }   // the slot's block is not retired: it stays for the slot's later batches
         g_up_block_size = n > UP_BLOCK_SIZE ? need : UP_BLOCK_SIZE;
         g_up_block = [g_dev newBufferWithLength:g_up_block_size options:MTLResourceStorageModePrivate];
-        if (!g_up_block) MDIE("failed to create the swizzled-upload staging block %#zx", g_up_block_size);
+        if (!g_up_block) { up_alloc_failed("continuation", g_up_block_size, n, need); MDIE("failed to create the swizzled-upload staging block %#zx", g_up_block_size); }
         res_add(g_up_block);
         g_up_block_off = 0;
     }

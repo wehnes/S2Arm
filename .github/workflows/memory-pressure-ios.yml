@@ -1,7 +1,7 @@
 name: memory-pressure-ios
 on:
   push:
-    branches: [debug/memory-headroom-v030]
+    branches: [debug/iogpu-descriptor-diag-v030]
   workflow_dispatch:
 permissions:
   contents: read
