@@ -7,6 +7,7 @@
 #include "as_type.h"
 #include <errno.h>
 #include <stdatomic.h>
+#include "guest_failure_diag.h"
 #include <sys/mman.h>
 #include <time.h>
 #if defined(__ANDROID__) && __has_include(<sys/system_properties.h>)
@@ -299,6 +300,49 @@ static uint64_t code_bytes(void) {
     return n;
 }
 static uint64_t pool_fixed(void) { return phys_limit_on() ? code_bytes() + g_mstack + L.sys_resource_size + g_phys : image_bytes(); }
+// Optional bounded evidence for guest-pool failures. g_mu protects the ring.
+static s2a_fail_ring g_guest_failures;
+static pthread_once_t g_guest_diag_once = PTHREAD_ONCE_INIT;
+static int g_guest_diag_enabled;
+static void guest_diag_config(void) {
+    const char *value = getenv("S2A_GUEST_FAILURE_DIAG");
+    g_guest_diag_enabled = value && *value && strcmp(value, "0");
+}
+static int guest_diag_on(void) { pthread_once(&g_guest_diag_once, guest_diag_config); return g_guest_diag_enabled; }
+__attribute__((weak)) unsigned s2a_guest_failure_frames(uint64_t fp, uint64_t *out, unsigned max) { (void)fp; (void)out; (void)max; return 0; }
+__attribute__((weak)) void s2a_guest_break_trace(uint64_t fp) { s2a_backtrace(fp); }
+static uint64_t guest_diag_tick(void) {
+    struct timespec now;
+    return clock_gettime(CLOCK_MONOTONIC, &now) ? 0 : (uint64_t)now.tv_sec * 1000000000ull + now.tv_nsec;
+}
+static void guest_pool_failure(int svc, const uint64_t *regs, uint64_t pc, uint64_t address, uint64_t requested, uint64_t added) {
+    if (!guest_diag_on()) return;
+    s2a_fail_event event = {.tick = guest_diag_tick(), .thread = (uintptr_t)pthread_self(), .pc = pc,
+        .lr = regs[30], .fp = regs[29], .address = address, .requested = requested, .added = added,
+        .used = g_heap_cur + pool_fixed(), .pool = APP_POOL, .result = 0x10801, .svc = (unsigned)svc};
+    event.caller_count = s2a_guest_failure_frames(event.fp, event.callers, 6);
+    s2a_fail_put(&g_guest_failures, &event);
+}
+static void guest_failures_dump(void) {
+    if (!guest_diag_on()) return;
+    s2a_fail_event events[S2A_FAIL_EVENTS]; unsigned count; uint64_t total;
+    if (!GMU_TRYLOCK()) { LOG("[guest_fail] ring unavailable: memory lock busy"); return; }
+    count = s2a_fail_copy(&g_guest_failures, events); total = g_guest_failures.total;
+    GMU_UNLOCK();
+    uint64_t now = guest_diag_tick();
+    LOG("[guest_fail] begin retained=%u total=%llu break_thread=%#llx", count, (unsigned long long)total, (unsigned long long)(uintptr_t)pthread_self());
+    for (unsigned index = 0; index < count; index++) {
+        s2a_fail_event *e = &events[index];
+        LOG("[guest_fail] event=%u age_ms=%llu thread=%#llx svc=%#x result=%#llx pc=%#llx lr=%#llx fp=%#llx address=%#llx requested=%llu added=%llu used=%llu pool=%llu",
+            index, (unsigned long long)(now >= e->tick ? (now - e->tick) / 1000000 : 0), (unsigned long long)e->thread,
+            e->svc, (unsigned long long)e->result, (unsigned long long)e->pc, (unsigned long long)e->lr, (unsigned long long)e->fp,
+            (unsigned long long)e->address, (unsigned long long)e->requested, (unsigned long long)e->added,
+            (unsigned long long)e->used, (unsigned long long)e->pool);
+        for (unsigned frame = 0; frame < e->caller_count; frame++)
+            LOG("[guest_fail] event=%u caller=%u pc=%#llx", index, frame, (unsigned long long)e->callers[frame]);
+    }
+    LOG("[guest_fail] end");
+}
 static uint64_t mask_minmax(uint32_t lo, uint32_t hi) { uint32_t r = hi - lo + 1; return r >= 64 ? ~0ull : ((1ull << r) - 1) << lo; }
 // apply = 0（s2a_npdm_window_need 量窗口跨度）：不写本局专属的 NPDM 状态（优先级 / 缺省核 / 核与优先级掩码 / 系统调用许可）——
 //   多款容器构造期要逐款读包内每一款的 NPDM（runtime/src/vawin.c），许可位是按位或累加的，读了别款就混进本局。本局的状态由起局时 layout_prepare / s2a_mem_init 按 apply = 1 读。
@@ -1336,7 +1380,10 @@ static int svc_mem_impl(int num, uint64_t *regs, uint64_t orig) {
         if (size & 0x1fffff) { regs[0] = 0xCA01; return 1; }   // InvalidSize：Horizon 要 2 MB 对齐
         GMU_LOCK();
         uint64_t fixed = pool_fixed();
-        if (fixed > APP_POOL || size > APP_POOL - fixed) { GMU_UNLOCK(); regs[0] = 0x10801; return 1; }
+        if (fixed > APP_POOL || size > APP_POOL - fixed) {
+            guest_pool_failure(num, regs, orig, (uint64_t)g_heap, size, size > g_heap_cur ? size - g_heap_cur : 0);
+            GMU_UNLOCK(); regs[0] = 0x10801; return 1;
+        }
         if (size > g_pk_heap_request) { g_pk_heap_request = size; addr_need_report(); }
         if (size > heap_region()) {
             GMU_UNLOCK();
@@ -1717,6 +1764,7 @@ static int svc_mem_impl(int num, uint64_t *regs, uint64_t orig) {
                 uint64_t add = 0;
                 for (uint64_t p = a; p < a + size; p += 0x1000) if (!(*amask_at(p) & (uint8_t)(1u << ((p & (HPG - 1)) >> 12)))) add += 0x1000;
                 if (g_heap_cur + pool_fixed() + add > APP_POOL) {
+                    guest_pool_failure(num, regs, orig, a, size, add);
                     static int said; if (!said++) LOG("物理映射到应用池上限：堆 %llu MB + 代码 %llu MB + 主线程栈 %llu KB + SystemResourceSize %llu MB + 已物理映射 %llu MB，本次再要 %llu KB > 池 %llu MB，回 ResLimitExceeded（同 Switch；只打第一次）",
                         (unsigned long long)(g_heap_cur >> 20), (unsigned long long)(code_bytes() >> 20), (unsigned long long)(g_mstack >> 10), (unsigned long long)(L.sys_resource_size >> 20), (unsigned long long)(g_phys >> 20), (unsigned long long)(add >> 10), (unsigned long long)(APP_POOL >> 20));
                     GMU_UNLOCK(); regs[0] = 0x10801; return 1;
@@ -1873,7 +1921,8 @@ static int svc_mem_impl(int num, uint64_t *regs, uint64_t orig) {
             uint32_t r = *(const volatile uint32_t *)(uintptr_t)regs[1];
             LOG("【红】Break 载荷结果码 %#x（%04u-%04u：模块 %u、描述 %u）", r, 2000 + (r & 0x1FF), (r >> 9) & 0x1FFF, r & 0x1FF, (r >> 9) & 0x1FFF);
         }
-        s2a_backtrace(regs[29]);
+        guest_failures_dump();
+        s2a_guest_break_trace(regs[29]);
         session_guest_end("游戏 Break");
 #if TARGET_OS_IPHONE
         // 资源包缺 / 不全导致的 Break（10-26 测试设备2：缺 ctl/control.nacp，App 退出像闪退）：不退出，停住游戏、弹缺资源包说明页（pack_apply.c）

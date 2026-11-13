@@ -1,6 +1,7 @@
 // 崩溃现场（旧库 crash.c 改后搬，只留信号处理本身）：出错地址、pc / lr 换成模块内偏移、寄存器、帧指针回溯、线程表。
 #include "native.h"
 #include "../../platform/plat.h"
+#include "guest_failure_diag.h"
 #include <signal.h>
 #include <dlfcn.h>
 #include <sys/ucontext.h>
@@ -48,6 +49,32 @@ static int s2a_frames(uint64_t fp, uint64_t *lr, int max) {
 void s2a_backtrace(uint64_t fp) {
     uint64_t lr[32]; int k = s2a_frames(fp, lr, 32);
     for (int i = 0; i < k; i++) { char b[160]; where(lr[i], b, sizeof b); LOG("  #%d %s", i, b); }
+}
+unsigned s2a_guest_failure_frames(uint64_t fp, uint64_t *out, unsigned max) {
+    return (unsigned)s2a_frames(fp, out, (int)(max > 6 ? 6 : max));
+}
+static int break_diag_read(void *ctx, uint64_t address, uint64_t *words, unsigned count) {
+    (void)ctx;
+    if (count > 24 || (count & 1)) return 0;
+    for (unsigned index = 0; index < count; index += 2)
+        if (!frame_read(address + index * 8, words + index)) return 0;
+    return 1;
+}
+static void break_diag_emit(void *ctx, unsigned depth, uint64_t address, const uint64_t *words, unsigned count) {
+    (void)ctx;
+    for (unsigned index = 0; index + 3 < count; index += 4)
+        LOG("[break_mem] depth=%u address=%#llx words=%016llx %016llx %016llx %016llx", depth,
+            (unsigned long long)(address + index * 8), (unsigned long long)words[index], (unsigned long long)words[index + 1],
+            (unsigned long long)words[index + 2], (unsigned long long)words[index + 3]);
+}
+void s2a_guest_break_trace(uint64_t fp) {
+    s2a_backtrace(fp);
+    const char *enabled = getenv("S2A_GUEST_FAILURE_DIAG");
+    if (!enabled || !*enabled || !strcmp(enabled, "0")) return;
+    LOG("[break_mem] begin fp=%#llx bounded pointer-shaped previews", (unsigned long long)fp);
+    s2a_diag_stats stats = s2a_diag_frames(fp, break_diag_read, break_diag_emit, NULL);
+    LOG("[break_mem] end frames=%u nodes=%u read_failures=%u limited=%u bytes=%llu", stats.frames, stats.nodes,
+        stats.failures, stats.limited, (unsigned long long)stats.bytes);
 }
 void s2a_thread_dump(void);
 #include "../../graphics/track/s2a_track.h"

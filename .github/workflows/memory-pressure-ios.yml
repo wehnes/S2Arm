@@ -1,7 +1,7 @@
 name: memory-pressure-ios
 on:
   push:
-    branches: [debug/iogpu-descriptor-diag-v030]
+    branches: [debug/guest-failure-diag-v030]
   workflow_dispatch:
 permissions:
   contents: read
@@ -60,6 +60,23 @@ jobs:
       - name: Native regression and negative control
         run: |
           mkdir -p build/ci-tests
+          clang -std=gnu11 -O1 -g -Wall -Wextra -Werror runtime/tests/t_guest_failure_diag.c -o build/ci-tests/t_guest_failure_diag
+          build/ci-tests/t_guest_failure_diag > build/ci-tests/guest-failure-green.log 2>&1
+          python3 - <<'PY'
+          from pathlib import Path
+          header = Path('runtime/src/guest_failure_diag.h').read_text()
+          assert 'if (depth < 2)' in header
+          Path('build/ci-tests/guest_failure_bad.h').write_text(header.replace('if (depth < 2)', 'if (depth < 1)'))
+          test = Path('runtime/tests/t_guest_failure_diag.c').read_text().replace('../src/guest_failure_diag.h', 'guest_failure_bad.h')
+          Path('build/ci-tests/test_bad.c').write_text(test)
+          PY
+          clang -std=gnu11 -O1 -g build/ci-tests/test_bad.c -o build/ci-tests/t_guest_failure_bad
+          if build/ci-tests/t_guest_failure_bad > build/ci-tests/guest-failure-negative.log 2>&1; then
+            echo 'Second-level pointer evidence negative control unexpectedly passed'
+            exit 1
+          fi
+          clang -std=gnu11 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer runtime/tests/t_guest_failure_diag.c -o build/ci-tests/t_guest_failure_asan
+          build/ci-tests/t_guest_failure_asan > build/ci-tests/guest-failure-sanitized.log 2>&1
           clang -std=gnu11 -O1 -g -DS2A_UNIT_TEST -Iruntime/include -Iruntime/src runtime/tests/t_lowva.c runtime/src/lowva.c -o build/ci-tests/t_lowva
           build/ci-tests/t_lowva > build/ci-tests/green.log 2>&1
           git show f2c78a8d4f96f2c9b8faa6305e7da38a855ca697:runtime/src/lowva.c > build/ci-tests/lowva-before.c
@@ -81,8 +98,8 @@ jobs:
           grep '16 cases, 3 failed' build/ci-tests/app-pool-negative.log
           clang -std=gnu11 -O1 -g -DS2A_UNIT_TEST -Iruntime/include -Iruntime/src runtime/tests/t_layout.c runtime/src/layout.c -o build/ci-tests/t_layout
           build/ci-tests/t_layout > build/ci-tests/layout.log 2>&1
-          make native-test-svc_mem > build/ci-tests/svc-mem.log 2>&1
-          xcrun --sdk iphoneos clang -target arm64-apple-ios18.0 -fsyntax-only -Iruntime/include runtime/src/layout.c
+          make native-test-crash native-test-svc_mem > build/ci-tests/svc-mem.log 2>&1
+          xcrun --sdk iphoneos clang -target arm64-apple-ios18.0 -fsyntax-only -Iruntime/include runtime/src/layout.c runtime/src/crash.c runtime/src/svc_mem.c
       - name: Build game-independent patched iOS shell
         run: |
           bash pack/shell_build.sh "$GITHUB_WORKSPACE/build/ci-shell" 2>&1 | tee build/ci-shell-build.log
