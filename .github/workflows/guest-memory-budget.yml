@@ -44,7 +44,18 @@ jobs:
           fi
           clang -std=gnu11 -O1 -g -Wall -Wextra -Werror -DS2A_UNIT_TEST -Iruntime/include -Iruntime/src runtime/tests/t_app_pool.c runtime/src/layout.c -o build/ci-tests/t_app_pool
           build/ci-tests/t_app_pool > build/ci-tests/budget-green.log 2>&1
-          make native-test-layout native-test-svc_mem native-test-app_pool_svc native-test-ios_guest_budget > build/ci-tests/native.log 2>&1
+          make native-test-layout native-test-svc_mem native-test-app_pool_svc native-test-ios_guest_budget native-test-vawin_container > build/ci-tests/native.log 2>&1
+          git show 8258fca5e9268078f5b8253b32336c4693d54bc1:runtime/src/vawin.c > build/ci-tests/vawin-before.c
+          clang -std=gnu11 -O1 -g -DS2A_UNIT_TEST -Iruntime/include -Iruntime/src -o build/tests/t_container_restore_before runtime/tests/t_vawin_container.c build/ci-tests/vawin-before.c runtime/src/svc_mem.c runtime/src/loader.c runtime/src/layout.c runtime/src/programs.c runtime/src/imgpack.c -Wl,-undefined,dynamic_lookup -Wl,-weak_library,build/tests/libs2a_vaguard.dylib
+          if S2A_APP_POOL_MB=2048 S2A_VAWIN_NORESERVE=1 build/tests/t_container_restore_before --budget > build/ci-tests/container-restore-red.log 2>&1; then
+            echo 'Container native pool restore negative control unexpectedly passed'
+            exit 1
+          fi
+          clang -std=gnu11 -O1 -g -DS2A_UNIT_TEST -Iruntime/include -Iruntime/src -o build/tests/t_container_npdm_before runtime/tests/t_vawin_container.c runtime/src/vawin.c build/ci-tests/svc-before.c runtime/src/loader.c runtime/src/layout.c runtime/src/programs.c runtime/src/imgpack.c -Wl,-undefined,dynamic_lookup -Wl,-weak_library,build/tests/libs2a_vaguard.dylib
+          if S2A_APP_POOL_MB=2048 S2A_VAWIN_NORESERVE=1 build/tests/t_container_npdm_before --budget > build/ci-tests/container-npdm-red.log 2>&1; then
+            echo 'Container NPDM pool negative control unexpectedly passed'
+            exit 1
+          fi
           clang -std=gnu11 -O1 -g -DS2A_UNIT_TEST -Iruntime/include -Iruntime/src runtime/tests/t_app_pool_svc.c build/ci-tests/svc-before.c build/ci-tests/layout-before.c build/tests/libs2a_vaguard.dylib -o build/tests/t_app_pool_svc_before
           if build/tests/t_app_pool_svc_before > build/ci-tests/svc-red.log 2>&1; then
             echo 'SVC negative control unexpectedly passed'

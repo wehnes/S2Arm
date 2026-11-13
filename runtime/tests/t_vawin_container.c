@@ -19,6 +19,8 @@
 #include <sys/wait.h>
 extern char **environ;
 uint64_t s2a_window_container_need(const char *bundle);   // vawin.c
+uint64_t s2a_app_pool_native(void);
+uint64_t s2a_npdm_window_need(const char *npdm);
 static int bad;
 static void ck(int ok, const char *what) { printf("%s %s\n", ok ? "✓" : "✗", what); if (!ok) bad++; }
 static void put(const char *path, const void *b, size_t n) { FILE *f = fopen(path, "wb"); if (!f) { perror(path); exit(1); } fwrite(b, 1, n, f); fclose(f); }
@@ -76,7 +78,33 @@ static int winok(const char *self, const char *dir, int apply_only, unsigned lon
     FILE *f = fopen(out, "r"); int ok = -1; *size_mb = 0; if (!f || fscanf(f, "%d %llu", &ok, size_mb) != 2) ok = -1; if (f) fclose(f);
     return ok;
 }
+static int reduced_budget(void) {
+    char tmp[] = "/tmp/t_vawin_budget.XXXXXX";
+    if (!mkdtemp(tmp)) return 1;
+    char path[1200];
+    const char *ids[] = {"0100000000020000", "0100000000040000"};
+    ck(s2a_app_pool() == 2048ull << 20, "reduced budget is active");
+    for (int order = 0; order < 2; order++) {
+        snprintf(path, sizeof path, "%s/mix%d", tmp, order);
+        const int kinds[] = {order ? 3 : 1, order ? 1 : 3};
+        bundle(path, ids, kinds, 2);
+        ck(ctr(path, tmp) == 68708, "mixed container uses 2048 MiB pool in both game orders");
+        ck(s2a_app_pool_native() == 0xCD500000ull, "container restores native capacity independently of budget");
+        ck(s2a_app_pool() == 2048ull << 20, "container keeps effective budget");
+    }
+    snprintf(path, sizeof path, "%s/switch1", tmp);
+    bundle(path, ids, (const int[]){1}, 1);
+    ck(ctr(path, tmp) == 68708 && s2a_app_pool_native() == 0xCD500000ull, "Switch container after mixed scan has correct native pool");
+    snprintf(path, sizeof path, "%s/mix1/Games/%s/main.npdm", tmp, ids[0]);
+    ck(s2a_npdm_window_need(path) == 68708ull << 20 && s2a_app_pool_native() == 9ull << 30, "Switch 2 NPDM selects its native pool");
+    snprintf(path, sizeof path, "%s/mix1/Games/%s/main.npdm", tmp, ids[1]);
+    ck(s2a_npdm_window_need(path) == 68708ull << 20 && s2a_app_pool_native() == 0xCD500000ull, "Switch NPDM after Switch 2 restores its own native pool");
+    snprintf(path, sizeof path, "rm -rf '%s'", tmp); if (system(path)) {}
+    printf("%s reduced-budget container: %d failures\n", bad ? "FAIL" : "PASS", bad);
+    return bad != 0;
+}
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--budget")) return reduced_budget();
     if (argc == 3 && !strcmp(argv[2], "winok")) { uint64_t base, size; s2a_window_get(&base, &size); printf("%d %llu\n", s2a_window_ok(), (unsigned long long)(size >> 20)); return 0; }
     if (argc == 3 && !strcmp(argv[2], "child")) { uint64_t nd, fit; s2a_window_need(&nd, &fit); printf("%llu\n", (unsigned long long)(nd >> 20)); return 0; }
     unsetenv("S2A_WIN_NEED_MB"); unsetenv("S2A_VAWIN_NORESERVE"); unsetenv("S2A_VA_CAP_MB"); unsetenv("S2A_VA_IOS26");
@@ -131,6 +159,12 @@ int main(int argc, char **argv) {
     snprintf(p, sizeof p, "%s/none.dylib", b);
     ck(s2a_imgpack_index(p, &pk, why, sizeof why) == S2A_IMG_ENOFILE && !pk, "⑤ 包不在：S2A_IMG_ENOFILE");
     snprintf(p, sizeof p, "rm -rf '%s'", tmp); if (system(p)) {}
+    setenv("S2A_APP_POOL_MB", "2048", 1);
+    setenv("S2A_VAWIN_NORESERVE", "1", 1);
+    char *child_args[] = {argv[0], "--budget", NULL}; pid_t child; int status = -1;
+    int spawn = posix_spawn(&child, argv[0], NULL, NULL, child_args, environ);
+    ck(!spawn && waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status), "reduced-budget mixed container regression");
+    unsetenv("S2A_APP_POOL_MB"); unsetenv("S2A_VAWIN_NORESERVE");
     printf("%s t_vawin_container：%d 处不符\n", bad ? "✗" : "✓", bad);
     return bad != 0;
 }
