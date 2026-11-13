@@ -28,8 +28,11 @@ jobs:
         run: |
           brew install bash ripgrep meson ninja pkg-config
           echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          echo "$pythonLocation/bin" >> "$GITHUB_PATH"
+          echo "S2A_PY=$pythonLocation/bin/python3" >> "$GITHUB_ENV"
           python3 -m pip install -r tools/rewriter-requirements.txt
           python3 runtime/rewriter/prepare_deps.py build/rewriter-deps
+          bash compat/fetch_base.sh
       - name: Regression and baseline negative controls
         shell: bash
         run: |
@@ -70,7 +73,7 @@ jobs:
         timeout-minutes: 20
         shell: bash
         run: |
-          bash tools/contrib_check.sh --base 8258fca5e9268078f5b8253b32336c4693d54bc1 > build/ci-tests/contrib.log 2>&1
+          CONTRIB_BASE_RERUN=1 bash tools/contrib_check.sh --base 8258fca5e9268078f5b8253b32336c4693d54bc1 > build/ci-tests/contrib.log 2>&1
       - name: Upload checks
         if: always()
         uses: actions/upload-artifact@v4
@@ -80,3 +83,6 @@ jobs:
           path: |
             build/ci-tests/*.log
             build/contrib_check/summary.md
+            build/contrib_check/*.log
+            build/contrib_check/*.err
+            build/tests/present-settings/**/run.log
