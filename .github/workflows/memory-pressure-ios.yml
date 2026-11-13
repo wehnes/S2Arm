@@ -99,6 +99,7 @@ jobs:
           clang -std=gnu11 -O1 -g -DS2A_UNIT_TEST -Iruntime/include -Iruntime/src runtime/tests/t_layout.c runtime/src/layout.c -o build/ci-tests/t_layout
           build/ci-tests/t_layout > build/ci-tests/layout.log 2>&1
           make native-test-crash native-test-svc_mem > build/ci-tests/svc-mem.log 2>&1
+          S2A_GUEST_FAILURE_DIAG=1 build/tests/t_svc_mem > build/ci-tests/svc-mem-diag-enabled.log 2>&1
           xcrun --sdk iphoneos clang -target arm64-apple-ios18.0 -fsyntax-only -Iruntime/include runtime/src/layout.c runtime/src/crash.c runtime/src/svc_mem.c
       - name: Build game-independent patched iOS shell
         run: |

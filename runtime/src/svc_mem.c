@@ -318,9 +318,14 @@ static uint64_t guest_diag_tick(void) {
 static void guest_pool_failure(int svc, const uint64_t *regs, uint64_t pc, uint64_t address, uint64_t requested, uint64_t added) {
     if (!guest_diag_on()) return;
     s2a_fail_event event = {.tick = guest_diag_tick(), .thread = (uintptr_t)pthread_self(), .pc = pc,
-        .lr = regs[30], .fp = regs[29], .address = address, .requested = requested, .added = added,
+        .address = address, .requested = requested, .added = added,
         .used = g_heap_cur + pool_fixed(), .pool = APP_POOL, .result = 0x10801, .svc = (unsigned)svc};
-    event.caller_count = s2a_guest_failure_frames(event.fp, event.callers, 6);
+    // Internal callers can provide only the argument registers. Guest dispatch
+    // supplies a full register frame together with an original module PC.
+    if (pc && module_of((void *)(uintptr_t)pc)) {
+        event.lr = regs[30]; event.fp = regs[29];
+        event.caller_count = s2a_guest_failure_frames(event.fp, event.callers, 6);
+    }
     s2a_fail_put(&g_guest_failures, &event);
 }
 static void guest_failures_dump(void) {
