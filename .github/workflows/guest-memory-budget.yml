@@ -20,6 +20,13 @@ jobs:
       - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73
         with:
           global-json-file: compat/tree/global.json
+      - name: Prepare contributor check dependencies
+        shell: bash
+        run: |
+          brew install bash ripgrep meson ninja pkg-config
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          python3 -m pip install -r tools/rewriter-requirements.txt
+          python3 runtime/rewriter/prepare_deps.py build/rewriter-deps
       - name: Regression and baseline negative controls
         shell: bash
         run: |
@@ -45,7 +52,7 @@ jobs:
           xcrun --sdk iphoneos clang -target arm64-apple-ios18.0 -fsyntax-only ios/guest_budget.m >> build/ci-tests/ios-syntax.log 2>&1
       - name: Contributor first-layer check
         continue-on-error: true
-        timeout-minutes: 4
+        timeout-minutes: 20
         shell: bash
         run: |
           bash tools/contrib_check.sh --base 8258fca5e9268078f5b8253b32336c4693d54bc1 > build/ci-tests/contrib.log 2>&1
