@@ -69,7 +69,6 @@ jobs:
           xcrun --sdk iphoneos clang -target arm64-apple-ios18.0 -fsyntax-only -Iruntime/include runtime/src/layout.c runtime/src/svc_mem.c > build/ci-tests/ios-syntax.log 2>&1
           xcrun --sdk iphoneos clang -target arm64-apple-ios18.0 -fsyntax-only ios/guest_budget.m >> build/ci-tests/ios-syntax.log 2>&1
       - name: Contributor first-layer check
-        continue-on-error: true
         timeout-minutes: 20
         shell: bash
         run: |
