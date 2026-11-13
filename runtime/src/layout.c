@@ -4,6 +4,7 @@
 //   游戏映射到那里时 svc 回内存不足（svc_mem.c win_has），不崩。
 #include "native.h"
 #include "as_type.h"
+#include <errno.h>
 
 #define GB (1ull << 30)
 #define MB (1ull << 20)
@@ -36,7 +37,52 @@ static void vamm_small(s2a_layout *o, uint64_t at, uint64_t stack, uint64_t heap
     o->aslr_base = at;                 o->aslr_size = stack + heap + VAMM_SHARED;
 }
 static uint64_t g_app_pool = 0xCD500000ull;
-uint64_t s2a_app_pool(void) { return g_app_pool; }
+static pthread_once_t g_pool_once = PTHREAD_ONCE_INIT;
+static uint64_t g_pool_cap = UINT64_MAX;
+
+// Total process allowance, including allocations already made at startup.
+// UINT64_MAX means unavailable. A measured zero is a valid exhausted limit.
+// The weak provider lets host tests cover device limits without iOS hardware.
+__attribute__((weak)) uint64_t s2a_app_pool_process_limit(void) {
+    return UINT64_MAX;
+}
+
+static int pool_mb(const char *value, uint64_t *bytes) {
+    if (!value || *value < '0' || *value > '9') return -1;
+    char *end; errno = 0;
+    uint64_t mb = strtoull(value, &end, 10);
+    if (errno || *end || mb > UINT64_MAX / MB) return -1;
+    *bytes = mb * MB;
+    return 0;
+}
+
+static void app_pool_config(void) {
+    const char *value = getenv("S2A_APP_POOL_MB");
+    if (!value || !*value) return;   // native capacity is the default
+    g_pool_cap = 0;   // an invalid explicit experiment must fail before launch
+    if (strcmp(value, "auto")) {
+        uint64_t bytes;
+        if (pool_mb(value, &bytes)) { LOG("【红】S2A_APP_POOL_MB 需为非负整数 MiB 或 auto，实验预算无效"); return; }
+        g_pool_cap = bytes ? bytes : UINT64_MAX;   // 0 explicitly restores native
+        if (bytes) LOG("实验应用池上限 %llu MiB（S2A_APP_POOL_MB，仍受本款原生池上限约束）", (unsigned long long)(bytes / MB));
+        return;
+    }
+    uint64_t reserve = 2560 * MB;
+    const char *setting = getenv("S2A_APP_POOL_RESERVE_MB");
+    if (setting && *setting && pool_mb(setting, &reserve)) { LOG("【红】S2A_APP_POOL_RESERVE_MB 需为非负整数 MiB，实验预算无效"); return; }
+    uint64_t limit = s2a_app_pool_process_limit();
+    if (limit == UINT64_MAX) { LOG("【红】自动客体预算取不到 iOS 进程内存额度，请恢复原生预算或显式指定 MiB"); return; }
+    if (limit <= reserve) { LOG("【红】自动客体预算无可用空间：进程额度 %llu MiB、预留 %llu MiB", (unsigned long long)(limit / MB), (unsigned long long)(reserve / MB)); return; }
+    g_pool_cap = (limit - reserve) & ~(2 * MB - 1);
+    LOG("实验自动应用池上限 %llu MiB：进程额度 %llu MiB、宿主与安全预留 %llu MiB（本进程固定，仍受原生池约束）",
+        (unsigned long long)(g_pool_cap / MB), (unsigned long long)(limit / MB), (unsigned long long)(reserve / MB));
+}
+
+uint64_t s2a_app_pool(void) {
+    pthread_once(&g_pool_once, app_pool_config);
+    return g_app_pool < g_pool_cap ? g_app_pool : g_pool_cap;
+}
+uint64_t s2a_app_pool_native(void) { return g_app_pool; }
 void s2a_app_pool_set(uint64_t v) { g_app_pool = v; }
 static void heapmode(s2a_layout *o, uint64_t b) {   // 堆模式（系统资源为 0）沿用 39 位布局；物理分配仍受应用池限制。别名区不调 MapPhysicalMemory 就不碰
     // 堆区 6 GiB；应用池比它大（Switch 2 的 9 GiB）时堆区放大到池（GiB 对齐），否则 SetHeapSize 给不满池（Pokopia 开局要约 8 GiB 堆）。别名区顺延，32 GiB 跨度内放得下
@@ -73,6 +119,7 @@ static int as36(s2a_layout *o, uint64_t W, uint64_t S, uint64_t mod, uint64_t *m
 
 // 甲（标准）布局的跨度：VAMM = 别名 + 小区（堆给满应用池）+ 模块；堆模式 = 32 GiB + 模块。宿主占窗口按它要（vawin.c），要不到整块也照样起
 uint64_t s2a_layout_need(uint32_t as_type, uint64_t sys_resource_size, uint64_t module_span) {
+    if (S2A_APP_POOL <= sys_resource_size) return 0;
     if ((as_type != 3 && as_type != 1) || module_span > 64 * GB) return 0;
     uint64_t mod = A2M(module_span);
     if (as_type == 1) return mod + AS36_TLR >= AS36_CODE ? 0 : 32 * GB;   // 模块在代码区里，跨度就是可随机区
@@ -81,6 +128,10 @@ uint64_t s2a_layout_need(uint32_t as_type, uint64_t sys_resource_size, uint64_t 
 
 int s2a_layout_compute(uint32_t as_type, uint64_t sys_resource_size, uint64_t module_span, int alias_gb, uint64_t W, uint64_t S, s2a_layout *o, uint64_t *mod_base, uint64_t *shadow_base) {
     memset(o, 0, sizeof *o); *mod_base = *shadow_base = 0;
+    if (S2A_APP_POOL <= sys_resource_size) {
+        LOG("【红】客体应用池预算不足或配置无效：池 %llu MiB、NPDM 系统资源 %llu MiB", (unsigned long long)(S2A_APP_POOL / MB), (unsigned long long)(sys_resource_size / MB));
+        return -3;
+    }
     uint64_t top = s2a_as_type_top(as_type);
     if (!top) return -1;
     if ((W & (GB - 1)) || module_span > 64 * GB || W > top || S > top - W) return -2;
