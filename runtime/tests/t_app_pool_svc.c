@@ -49,9 +49,10 @@ int main(void) {
         {"6144", 9ull << 30, 6144 * BUDGET_MB},
         {"2048", 0xCD500000ull, 2048 * BUDGET_MB},
         {"6144", 0xCD500000ull, 0xCD500000ull},
+        {"0", 9ull << 30, 9ull << 30},
     };
     int failures = 0;
-    for (unsigned index = 0; index < 3; index++) {
+    for (unsigned index = 0; index < sizeof cases / sizeof *cases; index++) {
         pid_t child = fork();
         if (child < 0) return 2;
         if (!child) {
@@ -62,6 +63,6 @@ int main(void) {
         int status;
         if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status)) failures++;
     }
-    printf("Application budget SVC: 3 cases, %d failed\n", failures);
+    printf("Application budget SVC: %zu cases, %d failed\n", sizeof cases / sizeof *cases, failures);
     return failures != 0;
 }

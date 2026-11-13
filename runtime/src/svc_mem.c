@@ -2075,8 +2075,8 @@ static int svc_mem_impl(int num, uint64_t *regs, uint64_t orig) {
         if ((uint32_t)regs[2]) { regs[0] = 0xE401; regs[1] = 0; return 1; }
         if (id < 2) {
             if ((uint64_t)sub > 3) { regs[0] = 0xE801; regs[1] = 0; return 1; }
-            // 4 GB 机型的内存区（Ryujinx KSystemControl / KernelInit）：应用 3285 MiB、小程序 507 MiB、系统服务约 251 MiB（上游注释量级，取决于内核保留区，近似）、
-            //   nv 服务 (0x2238 + 0x710 + 0x80) × 4 KB。只有应用区按实际记账算空闲；其余三区游戏碰不到，空闲按总量报
+            // 应用区按本款有效池报总量与空闲（GetInfo / 分配核算同口径）；其余区沿用 4 GB 机型的 Ryujinx KSystemControl / KernelInit 值：
+            //   小程序 507 MiB、系统服务约 251 MiB、nv 服务 (0x2238 + 0x710 + 0x80) × 4 KB，游戏碰不到，空闲按总量报
             static const uint64_t total[4] = {0, 507ull << 20, 251ull << 20, (0x2238ull + 0x710 + 0x80) << 12};
             v = total[sub];
             if (sub == 0) {
